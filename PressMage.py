@@ -8,6 +8,7 @@ from __future__ import annotations
 import sys
 import time
 from dataclasses import dataclass
+import threading
 from typing import Callable, Deque, Dict, List, Optional, Tuple
 from collections import deque
 
@@ -108,6 +109,31 @@ class ArrowQueueEngine:
 
 def run_gui_app() -> None:
     """Импорт и запуск GUI."""
+    if sys.platform != "win32":
+        raise RuntimeError("GUI поддерживается только на Windows. Используйте флаг --test для запуска тестов.")
+
+    import importlib.util
+
+    required = [
+        "ctypes",
+        "winsound",
+        "psutil",
+        "numpy",
+        "cv2",
+        "PIL.ImageGrab",
+        "pyautogui",
+        "win32gui",
+        "win32process",
+        "win32con",
+        "PyQt5",
+    ]
+    missing = [name for name in required if importlib.util.find_spec(name) is None]
+    if missing:
+        raise RuntimeError(
+            "Для запуска GUI отсутствуют зависимости: " + ", ".join(sorted(missing)) +
+            ". Установите их и повторите попытку."
+        )
+
     import os
     import ctypes
     from ctypes import wintypes
@@ -327,6 +353,7 @@ def run_gui_app() -> None:
             super().__init__()
             self._running = False
             self._paused = False
+            self._stop_event = threading.Event()
             self._sessions = 0
             self._arrows_found = 0
             self._keys_pressed = 0
@@ -360,26 +387,31 @@ def run_gui_app() -> None:
         def stop(self):
             self._running = False; self._paused = False; self.log_sig.emit("Поток остановлен", "info")
 
+        def shutdown(self):
+            self._running = False
+            self._paused = False
+            self._stop_event.set()
+
         def toggle_pause(self):
             self._paused = not self._paused
             self.log_sig.emit("Пауза: ВКЛ" if self._paused else "Пауза: ВЫКЛ",
                               "warning" if self._paused else "success")
 
         def run(self):
-            while True:
+            while not self._stop_event.is_set():
                 if not self._running or self._paused:
-                    time.sleep(0.05); continue
+                    self._stop_event.wait(0.05); continue
                 try:
                     proc_name = str(self.params.get("process_name", ""))
                     hwnd = get_window_by_process(proc_name)
                     if not hwnd:
-                        time.sleep(0.3); continue
+                        self._stop_event.wait(0.3); continue
                     geom = get_window_geometry(hwnd)
                     if not geom:
-                        time.sleep(0.3); continue
+                        self._stop_event.wait(0.3); continue
                     l, t, r, b = geom
                     if r - l <= 0 or b - t <= 0:
-                        time.sleep(0.2); continue
+                        self._stop_event.wait(0.2); continue
 
                     roi = (
                         l + int(self.params.get("roi_left", 0)),
@@ -445,10 +477,12 @@ def run_gui_app() -> None:
                         self.stats_sig.emit(self._arrows_found, len(self.engine.pressed_log), self._sessions)
                         self.progress_sig.emit()
 
-                    time.sleep(float(self.params.get("loop_delay", 0.10)))
+                    self._stop_event.wait(float(self.params.get("loop_delay", 0.10)))
                 except Exception as e:
                     self.log_sig.emit(f"Ошибка в цикле: {e}", "error")
-                    time.sleep(0.2)
+                    self._stop_event.wait(0.2)
+
+            self.log_sig.emit("Рабочий поток завершён", "info")
 
         def _on_engine_press(self, direction: str, when: float):
             key = str(self.params.get(f"key_{direction}", direction))
@@ -996,6 +1030,9 @@ def run_gui_app() -> None:
                 self._save_settings()
                 self.worker.stop()
                 self.hotkey_filter.unregister()
+                self.worker.shutdown()
+                self.thread.quit()
+                self.thread.wait(1500)
             finally:
                 event.accept()
 
