@@ -161,7 +161,10 @@ def run_gui_app() -> None:
             return False
 
     # ---------- NMS (простая по центрам) ----------
-    def nms_detections(dets: List[Tuple[int,int,int,int,str,float]], radius: int = 12) -> List[Tuple[int,int,int,int,str,float]]:
+    def nms_detections(
+        dets: List[Tuple[int, int, int, int, str, float]],
+        radius: int = 12,
+    ) -> List[Tuple[int, int, int, int, str, float]]:
         dets = sorted(dets, key=lambda d: d[5], reverse=True)
         picked: List[Tuple[int,int,int,int,str,float]] = []
         centers: List[Tuple[float,float]] = []
@@ -576,10 +579,12 @@ def run_gui_app() -> None:
             btn_clear = QPushButton('Очистить логи'); btn_clear.clicked.connect(lambda: self.log_text.clear()); vb3.addWidget(btn_clear)
             v.addWidget(gb3)
 
-            info = QLabel('• Очередь: жмём в порядке появления.
-• Две задержки действуют вместе: между нажатиями и после появления.
-• ROI выбирается ТОЛЬКО внутри окна игры.
-• Живой оверлей Ctrl+F4: подсветка детекций прямо в игре.')
+            info = QLabel(
+                "• Очередь: жмём в порядке появления.\n"
+                "• Две задержки действуют вместе: между нажатиями и после появления.\n"
+                "• ROI выбирается ТОЛЬКО внутри окна игры.\n"
+                "• Живой оверлей Ctrl+F4: подсветка детекций прямо в игре."
+            )
             info.setStyleSheet("background:#e8f4f8;padding:10px;border-radius:8px;border:2px solid #b3e0f2;font-weight:bold;")
             v.addWidget(info)
             return w
