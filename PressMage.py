@@ -1,7 +1,8 @@
 """
-PressMage — магия нажатий в двух слогах. v4.4 —  (ядро + GUI)
+PressMage v4.5 — (ядро + GUI) — магия нажатий в двух слогах. 
 
 """
+
 
 from __future__ import annotations
 import sys
@@ -28,7 +29,7 @@ class ArrowQueueEngine:
         даже если одновременно видны несколько стрелок.
       • Нажимать можно, только если:
           - прошло минимум `min_press_interval` с предыдущего нажатия;
-          - событие пролежало в очереди не меньше `min_age_before_press`.
+          - собыие пролежало в очереди не меньше `min_age_before_press`.
 
     Параметры:
       - on_press: callback(direction:str, when:float) — вызывается при нажатии.
@@ -126,7 +127,7 @@ def run_gui_app() -> None:
         QCheckBox, QTabWidget, QProgressBar, QFileDialog, QTableWidget, QTableWidgetItem,
         QStatusBar, QSpinBox, QGridLayout, QFrame
     )
-    from PyQt5.QtCore import Qt, QTimer, QSettings, pyqtSignal, QObject, QThread, QSize, QRect, QAbstractNativeEventFilter
+    from PyQt5.QtCore import Qt, QTimer, QSettings, pyqtSignal, QObject, QThread, QRect, QAbstractNativeEventFilter
     from PyQt5.QtGui import QColor, QPixmap, QImage, QPainter, QPen
 
     # ---------- WinAPI утилиты ----------
@@ -158,6 +159,21 @@ def run_gui_app() -> None:
             return True
         except Exception:
             return False
+
+    # ---------- NMS (простая по центрам) ----------
+    def nms_detections(dets: List[Tuple[int,int,int,int,str,float]], radius: int = 12) -> List[Tuple[int,int,int,int,str,float]]:
+        dets = sorted(dets, key=lambda d: d[5], reverse=True)
+        picked: List[Tuple[int,int,int,int,str,float]] = []
+        centers: List[Tuple[float,float]] = []
+        for d in dets:
+            cx = d[0] + d[2]/2.0; cy = d[1] + d[3]/2.0
+            ok = True
+            for (px, py) in centers:
+                if abs(px - cx) + abs(py - cy) <= radius:
+                    ok = False; break
+            if ok:
+                picked.append(d); centers.append((cx, cy))
+        return picked
 
     # ---------- Раскраска логов ----------
     COLOR_MAP = {
@@ -255,13 +271,232 @@ def run_gui_app() -> None:
             if e.key() == Qt.Key_Escape:
                 self.canceled.emit(); self.close()
 
-    class MainWindow(QMainWindow):(QMainWindow):
+    # ---------- Живой оверлей поверх игры ----------
+    class LiveOverlay(QWidget):
+        """Полупрозрачный оверлей поверх окна игры. Рисует текущие детекции в реальном времени.
+        Координаты детекций подаются в экранных координатах, мы вычитаем левый/верхний края окна игры.
+        """
+        def __init__(self):
+            super().__init__()
+            self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+            self.setAttribute(Qt.WA_TranslucentBackground, True)
+            self.setAttribute(Qt.WA_NoSystemBackground, True)
+            self.setAttribute(Qt.WA_TransparentForMouseEvents, True)  # клики проходят в игру
+            self._geom: Optional[Tuple[int,int,int,int]] = None  # (l,t,r,b)
+            self._dets: List[Tuple[int,int,int,int,str,float]] = []
+            self._colors = {
+                'up':   QColor(0,255,0,220),
+                'down': QColor(255,0,0,220),
+                'left': QColor(0,120,255,220),
+                'right':QColor(255,255,0,220)
+            }
+            self._pen_w = 2
+
+        def update_frame(self, dets: List[Tuple[int,int,int,int,str,float]], geom: Tuple[int,int,int,int]):
+            self._dets = dets or []
+            self._geom = geom
+            if geom:
+                l,t,r,b = geom
+                self.setGeometry(l, t, r-l, b-t)
+            self.update()
+
+        def paintEvent(self, e):
+            if not self._geom:
+                return
+            p = QPainter(self)
+            for (x,y,w,h,d,score) in self._dets:
+                l,t,_,_ = self._geom
+                rx, ry = x - l, y - t
+                col = self._colors.get(d, QColor(255,255,255,220))
+                p.setPen(QPen(col, self._pen_w))
+                p.drawRect(rx, ry, w, h)
+                p.drawText(rx+2, max(10, ry-4), f"{d}:{score:.2f}")
+            p.end()
+
+    # ---------- Рабочий поток с детекцией + очередь ----------
+    class BotWorker(QObject):
+        log_sig = pyqtSignal(str, str)            # message, level
+        stats_sig = pyqtSignal(int, int, int)     # arrows_found, keys_pressed, sessions
+        progress_sig = pyqtSignal()
+        det_sig = pyqtSignal(list, tuple, tuple)  # детекции (экранные координаты), геометрия окна игры (l,t,r,b), ROI (x1,y1,x2,y2)
+
         def __init__(self) -> None:
             super().__init__()
-            self.setWindowTitle('Помощник для стрелок v4.4 — Последовательный режим')
+            self._running = False
+            self._paused = False
+            self._sessions = 0
+            self._arrows_found = 0
+            self._keys_pressed = 0
+            self._session_start = 0.0
+
+            self.params: Dict[str, float | bool | str] = {}
+            self.templates: Dict[str, np.ndarray] = {}
+            self._active: List[Tuple[str, Tuple[int, int], float]] = []  # (dir, (x,y), last_seen)
+
+            self.engine = ArrowQueueEngine(
+                min_press_interval=0.5,
+                min_age_before_press=0.0,
+                dedup_window_sec=0.10,
+                on_press=self._on_engine_press,
+            )
+
+        def set_params(self, params: Dict[str, float | bool | str], templates: Dict[str, np.ndarray]):
+            self.params = params
+            self.templates = templates
+            self.engine.min_press_interval = float(params.get("min_press_interval", 0.5))
+            self.engine.min_age_before_press = float(params.get("min_age_before_press", 0.0))
+            self.engine.dedup_window_sec = float(params.get("dedup_window", 0.10))
+
+        def start(self):
+            if not self.templates:
+                self.log_sig.emit("Нет загруженных шаблонов", "error"); return
+            self._running = True; self._paused = False; self._sessions += 1
+            self._arrows_found = 0; self._keys_pressed = 0
+            self._session_start = time.time(); self.log_sig.emit("Поток запущен", "success")
+
+        def stop(self):
+            self._running = False; self._paused = False; self.log_sig.emit("Поток остановлен", "info")
+
+        def toggle_pause(self):
+            self._paused = not self._paused
+            self.log_sig.emit("Пауза: ВКЛ" if self._paused else "Пауза: ВЫКЛ",
+                              "warning" if self._paused else "success")
+
+        def run(self):
+            while True:
+                if not self._running or self._paused:
+                    time.sleep(0.05); continue
+                try:
+                    proc_name = str(self.params.get("process_name", ""))
+                    hwnd = get_window_by_process(proc_name)
+                    if not hwnd:
+                        time.sleep(0.3); continue
+                    geom = get_window_geometry(hwnd)
+                    if not geom:
+                        time.sleep(0.3); continue
+                    l, t, r, b = geom
+                    if r - l <= 0 or b - t <= 0:
+                        time.sleep(0.2); continue
+
+                    roi = (
+                        l + int(self.params.get("roi_left", 0)),
+                        t + int(self.params.get("roi_top", 0)),
+                        r - int(self.params.get("roi_right", 0)),
+                        b - int(self.params.get("roi_bottom", 0)),
+                    )
+                    roi = (max(roi[0], l), max(roi[1], t), max(min(roi[2], r), l+1), max(min(roi[3], b), t+1))
+
+                    shot = ImageGrab.grab(bbox=roi)
+                    frame = np.array(shot)
+                    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+                    if bool(self.params.get("use_canny", False)):
+                        gray = cv2.Canny(gray, 60, 120)
+
+                    matches: List[Tuple[int,int,int,int,str,float]] = []  # x,y,w,h,dir,score
+                    thr = float(self.params.get("threshold", 0.8))
+                    for direction, templ in self.templates.items():
+                        tpl = cv2.Canny(templ, 60, 120) if bool(self.params.get("use_canny", False)) else templ
+                        res = cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED)
+                        loc = np.where(res >= thr)
+                        h, w = tpl.shape[:2]
+                        for pt in zip(*loc[::-1]):
+                            score = float(res[pt[1], pt[0]])
+                            matches.append((pt[0], pt[1], w, h, direction, score))
+
+                    matches = nms_detections(matches, radius=12)
+
+                    # Передадим детекции в экранных координатах для живого оверлея
+                    dets_screen: List[Tuple[int,int,int,int,str,float]] = []
+                    roi_x, roi_y = roi[0], roi[1]
+                    for (x, y, w, h, d, score) in matches:
+                        dets_screen.append((roi_x + x, roi_y + y, w, h, d, score))
+
+                    self.det_sig.emit(dets_screen, (l, t, r, b), roi)
+
+                    now = time.time()
+                    new_active: List[Tuple[str, Tuple[int, int], float]] = []
+                    new_count = 0
+                    # стабилизация и учёт исчезновения
+                    for (x, y, w, h, d, score) in matches:
+                        center = (x + w // 2, y + h // 2)
+                        matched_idx = -1
+                        for idx, (ad, (ax, ay), last_seen) in enumerate(self._active):
+                            if ad == d and (abs(ax - center[0]) + abs(ay - center[1])) <= 12:
+                                matched_idx = idx; break
+                        if matched_idx == -1:
+                            self.engine.enqueue_event(d, now)
+                            self._arrows_found += 1; new_count += 1
+                            new_active.append((d, center, now))
+                        else:
+                            ad, (ax, ay), _ = self._active[matched_idx]
+                            new_active.append((ad, (ax, ay), now))
+
+                    disappear = float(self.params.get("disappear_timeout", 0.5))
+                    self._active = [(d, pos, ls) for (d, pos, ls) in new_active if (now - ls) <= disappear]
+
+                    pressed = self.engine.tick(now)
+                    if new_count:
+                        self.stats_sig.emit(self._arrows_found, len(self.engine.pressed_log), self._sessions)
+                        self.log_sig.emit(f"Новых стрелок: {new_count}", "info")
+                    if pressed:
+                        self.stats_sig.emit(self._arrows_found, len(self.engine.pressed_log), self._sessions)
+                        self.progress_sig.emit()
+
+                    time.sleep(float(self.params.get("loop_delay", 0.10)))
+                except Exception as e:
+                    self.log_sig.emit(f"Ошибка в цикле: {e}", "error")
+                    time.sleep(0.2)
+
+        def _on_engine_press(self, direction: str, when: float):
+            key = str(self.params.get(f"key_{direction}", direction))
+            if bool(self.params.get("simulation", True)):
+                self.log_sig.emit(f"[SIM] Нажал: {key}", "info")
+            else:
+                pyautogui.press(key)
+                winsound.Beep(1200, 30)
+                self.log_sig.emit(f"Нажата клавиша: {key}", "success")
+
+    # ---------- Глобальные горячие клавиши ----------
+    MOD_CONTROL=0x0002
+    WM_HOTKEY=0x0312
+
+    class HotkeyFilter(QAbstractNativeEventFilter):
+        def __init__(self, owner_start: Callable, owner_pause: Callable, owner_stop: Callable, owner_preview: Callable):
+            super().__init__()
+            self.start_cb = owner_start; self.pause_cb = owner_pause; self.stop_cb = owner_stop; self.preview_cb = owner_preview
+            self.user32 = ctypes.windll.user32
+            self.ID_START=1; self.ID_PAUSE=2; self.ID_STOP=3; self.ID_PREVIEW=4
+            self.user32.RegisterHotKey(None, self.ID_START,  MOD_CONTROL, 0x70)  # Ctrl+F1
+            self.user32.RegisterHotKey(None, self.ID_PAUSE,  MOD_CONTROL, 0x71)  # Ctrl+F2
+            self.user32.RegisterHotKey(None, self.ID_STOP,   MOD_CONTROL, 0x72)  # Ctrl+F3
+            self.user32.RegisterHotKey(None, self.ID_PREVIEW,MOD_CONTROL, 0x73)  # Ctrl+F4
+
+        def nativeEventFilter(self, eventType, message):
+            if eventType != 'windows_generic_MSG':
+                return False, 0
+            msg = ctypes.wintypes.MSG.from_address(message.__int__())
+            if msg.message == WM_HOTKEY:
+                hot_id = msg.wParam
+                if   hot_id == self.ID_START:   self.start_cb()
+                elif hot_id == self.ID_PAUSE:   self.pause_cb()
+                elif hot_id == self.ID_STOP:    self.stop_cb()
+                elif hot_id == self.ID_PREVIEW: self.preview_cb()
+            return False, 0
+
+        def unregister(self):
+            self.user32.UnregisterHotKey(None, self.ID_START)
+            self.user32.UnregisterHotKey(None, self.ID_PAUSE)
+            self.user32.UnregisterHotKey(None, self.ID_STOP)
+            self.user32.UnregisterHotKey(None, self.ID_PREVIEW)
+
+    # ---------- Главное окно ----------
+    class MainWindow(QMainWindow):
+        def __init__(self) -> None:
+            super().__init__()
+            self.setWindowTitle('Помощник для стрелок v4.5 — Последовательный режим')
             self.setGeometry(120, 120, 940, 740)
 
-            self.settings = QSettings('ArrowHelper', 'ArrowBotV44')
+            self.settings = QSettings('ArrowHelper', 'ArrowBotV45')
             self.templates: Dict[str, np.ndarray] = {}
 
             self.worker = BotWorker()
@@ -270,6 +505,7 @@ def run_gui_app() -> None:
             self.worker.log_sig.connect(self._on_log)
             self.worker.stats_sig.connect(self._on_stats)
             self.worker.progress_sig.connect(self._on_progress)
+            self.worker.det_sig.connect(self._on_detections)
             self.thread.start()
 
             self._build_ui()
@@ -279,8 +515,14 @@ def run_gui_app() -> None:
             self.stats = {"sessions": 0, "start": None}
             self.session_timer = QTimer(self); self.session_timer.timeout.connect(self._update_time)
 
-            self.hotkey_filter = HotkeyFilter(self._start_hotkey, self._pause_hotkey, self._stop_hotkey)
+            self.hotkey_filter = HotkeyFilter(self._start_hotkey, self._pause_hotkey, self._stop_hotkey, self._toggle_live_overlay)
             QApplication.instance().installNativeEventFilter(self.hotkey_filter)
+
+            # Живой оверлей и буферы последних детекций
+            self.live_overlay: Optional[LiveOverlay] = None
+            self._last_dets: List[Tuple[int,int,int,int,str,float]] = []
+            self._last_geom: Optional[Tuple[int,int,int,int]] = None
+            self._last_roi: Optional[Tuple[int,int,int,int]] = None
 
         # --- UI ---
         def _build_ui(self):
@@ -290,7 +532,7 @@ def run_gui_app() -> None:
             tab.addTab(self._tab_stats(), "Статистика")
             tab.addTab(self._tab_templates(), "Шаблоны")
             self.status_bar = QStatusBar(); self.setStatusBar(self.status_bar)
-            self.status_bar.showMessage('Готов к работе — v4.4')
+            self.status_bar.showMessage('Готов к работе — v4.5')
 
         def _tab_control(self) -> QWidget:
             w = QWidget(); v = QVBoxLayout(w)
@@ -336,7 +578,8 @@ def run_gui_app() -> None:
 
             info = QLabel('• Очередь: жмём в порядке появления.
 • Две задержки действуют вместе: между нажатиями и после появления.
-• ROI выбирается ТОЛЬКО внутри окна игры.')
+• ROI выбирается ТОЛЬКО внутри окна игры.
+• Живой оверлей Ctrl+F4: подсветка детекций прямо в игре.')
             info.setStyleSheet("background:#e8f4f8;padding:10px;border-radius:8px;border:2px solid #b3e0f2;font-weight:bold;")
             v.addWidget(info)
             return w
@@ -468,7 +711,7 @@ def run_gui_app() -> None:
 
             self.btn_start.setEnabled(False); self.btn_pause.setEnabled(True); self.btn_stop.setEnabled(True)
             self.status_label.setText("Статус: Работает — Последовательный режим"); self.status_label.setStyleSheet("color:green;font-weight:bold;font-size:14px;")
-            self.status_bar.showMessage('Бот запущен — v4.4')
+            self.status_bar.showMessage('Бот запущен — v4.5')
             self.stats["sessions"] += 1; self.stats["start"] = time.time(); self.session_timer.start(1000)
             self._on_log("Бот запущен", "success")
 
@@ -491,6 +734,20 @@ def run_gui_app() -> None:
         def _stop_hotkey(self):
             if self.btn_stop.isEnabled(): self._stop()
 
+        # ---- живой оверлей ----
+        def _toggle_live_overlay(self):
+            if self.live_overlay and self.live_overlay.isVisible():
+                self.live_overlay.close(); self.live_overlay = None
+                self._on_log("Живой оверлей: ВЫКЛ", "warning")
+            else:
+                self.live_overlay = LiveOverlay()
+                if self._last_geom:
+                    l,t,r,b = self._last_geom; self.live_overlay.setGeometry(l, t, r-l, b-t)
+                self.live_overlay.show()
+                if self._last_dets and self._last_geom:
+                    self.live_overlay.update_frame(self._last_dets, self._last_geom)
+                self._on_log("Живой оверлей: ВКЛ (Ctrl+F4)", "success")
+
         # --- сервис ---
         def _on_log(self, message: str, level: str = "info"):
             ts = time.strftime("%H:%M:%S"); self.log_text.append(color_span(f"[{ts}] {message}", level))
@@ -502,6 +759,11 @@ def run_gui_app() -> None:
         def _on_progress(self):
             self.progress_bar.setVisible(True); self.progress_bar.setValue(100)
             QTimer.singleShot(350, lambda: self.progress_bar.setVisible(False))
+
+        def _on_detections(self, dets: list, geom: tuple, roi: tuple):
+            self._last_dets = dets; self._last_geom = geom; self._last_roi = roi
+            if self.live_overlay:
+                self.live_overlay.update_frame(dets, geom)
 
         def _update_time(self):
             if not self.stats["start"]: return
@@ -664,7 +926,6 @@ def run_gui_app() -> None:
                 QMessageBox.critical(self, 'Ошибка', f'Не удалось удалить: {e}')
 
         def _load_templates(self):
-            import numpy as np
             self.templates.clear(); self.table.setRowCount(0)
             arrow_types = ['up','down','left','right']
             loaded = 0
