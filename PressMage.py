@@ -348,6 +348,7 @@ def run_gui_app() -> None:
         stats_sig = pyqtSignal(int, int, int)     # arrows_found, keys_pressed, sessions
         progress_sig = pyqtSignal()
         det_sig = pyqtSignal(list, tuple, tuple)  # детекции (экранные координаты), геометрия окна игры (l,t,r,b), ROI (x1,y1,x2,y2)
+        auto_pause_sig = pyqtSignal(bool)         # True — автопауза активна
 
         def __init__(self) -> None:
             super().__init__()
@@ -380,12 +381,25 @@ def run_gui_app() -> None:
         def start(self):
             if not self.templates:
                 self.log_sig.emit("Нет загруженных шаблонов", "error"); return
-            self._running = True; self._paused = False; self._sessions += 1
+            self._running = True; self._paused = False; self._auto_paused = False
+            self._sessions += 1
             self._arrows_found = 0; self._keys_pressed = 0
             self._session_start = time.time(); self.log_sig.emit("Поток запущен", "success")
 
         def stop(self):
-            self._running = False; self._paused = False; self.log_sig.emit("Поток остановлен", "info")
+            self._running = False; self._paused = False
+            if self._auto_paused:
+                self._auto_paused = False
+                self.auto_pause_sig.emit(False)
+            self.log_sig.emit("Поток остановлен", "info")
+
+        def shutdown(self):
+            self._running = False
+            self._paused = False
+            if self._auto_paused:
+                self._auto_paused = False
+                self.auto_pause_sig.emit(False)
+            self._stop_event.set()
 
         def shutdown(self):
             self._running = False
@@ -489,7 +503,12 @@ def run_gui_app() -> None:
             if bool(self.params.get("simulation", True)):
                 self.log_sig.emit(f"[SIM] Нажал: {key}", "info")
             else:
-                pyautogui.press(key)
+                key_delay = float(self.params.get("key_delay", 0.03))
+                key_delay = max(0.0, key_delay)
+                pyautogui.keyDown(key)
+                if key_delay:
+                    time.sleep(key_delay)
+                pyautogui.keyUp(key)
                 winsound.Beep(1200, 30)
                 self.log_sig.emit(f"Нажата клавиша: {key}", "success")
 
@@ -543,6 +562,7 @@ def run_gui_app() -> None:
             self.worker.stats_sig.connect(self._on_stats)
             self.worker.progress_sig.connect(self._on_progress)
             self.worker.det_sig.connect(self._on_detections)
+            self.worker.auto_pause_sig.connect(self._on_auto_pause)
             self.thread.start()
 
             self._build_ui()
@@ -551,6 +571,8 @@ def run_gui_app() -> None:
 
             self.stats = {"sessions": 0, "start": None}
             self.session_timer = QTimer(self); self.session_timer.timeout.connect(self._update_time)
+            self._manual_paused = False
+            self._auto_paused = False
 
             self.hotkey_filter = HotkeyFilter(self._start_hotkey, self._pause_hotkey, self._stop_hotkey, self._toggle_live_overlay)
             QApplication.instance().installNativeEventFilter(self.hotkey_filter)
@@ -661,11 +683,13 @@ def run_gui_app() -> None:
 
             self.use_canny = QCheckBox("Поиск по контурам (Canny)")
             self.simulation = QCheckBox("Симуляция (не нажимать клавиши)"); self.simulation.setChecked(True)
+            self.auto_pause_focus = QCheckBox("Авто-пауза, если окно игры не активно"); self.auto_pause_focus.setChecked(True)
             self.preview_draw_boxes = QCheckBox("Показывать рамки детекций в предпросмотре"); self.preview_draw_boxes.setChecked(True)
 
             form.addRow(roi)
             form.addRow(grid2)
             form.addRow("Доп. режимы:", self.use_canny)
+            form.addRow("", self.auto_pause_focus)
             form.addRow("", self.simulation)
             form.addRow("Предпросмотр:", self.preview_draw_boxes)
 
@@ -736,10 +760,12 @@ def run_gui_app() -> None:
                 "roi_left": self.roi_left.value(), "roi_top": self.roi_top.value(),
                 "roi_right": self.roi_right.value(), "roi_bottom": self.roi_bottom.value(),
                 "use_canny": self.use_canny.isChecked(),
+                "auto_focus_pause": self.auto_pause_focus.isChecked(),
                 "simulation": self.simulation.isChecked(),
                 "min_press_interval": self.min_press_interval.value(),
                 "min_age_before_press": self.min_age_before_press.value(),
                 "dedup_window": self.dedup_window.value(),
+                "key_delay": self.key_delay.value(),
                 "key_up": self.key_up.currentText(),
                 "key_down": self.key_down.currentText(),
                 "key_left": self.key_left.currentText(),
@@ -748,7 +774,10 @@ def run_gui_app() -> None:
             self.worker.set_params(params, self.templates)
             self.worker.start()
 
+            self._manual_paused = False
+            self._auto_paused = False
             self.btn_start.setEnabled(False); self.btn_pause.setEnabled(True); self.btn_stop.setEnabled(True)
+            self.btn_pause.setText('Пауза')
             self.status_label.setText("Статус: Работает — Последовательный режим"); self.status_label.setStyleSheet("color:green;font-weight:bold;font-size:14px;")
             self.status_bar.showMessage('Бот запущен — v4.5')
             self.stats["sessions"] += 1; self.stats["start"] = time.time(); self.session_timer.start(1000)
@@ -756,10 +785,25 @@ def run_gui_app() -> None:
 
         def _pause(self):
             self.worker.toggle_pause()
+            self._manual_paused = not self._manual_paused
+            if self._manual_paused:
+                self.btn_pause.setText('Продолжить')
+                self.status_label.setText("Статус: Пауза (Ctrl+F2)")
+                self.status_label.setStyleSheet("color:#FF9800;font-weight:bold;font-size:14px;")
+                self.status_bar.showMessage('Бот приостановлен пользователем')
+            else:
+                self.btn_pause.setText('Пауза')
+                if not self._auto_paused:
+                    self.status_label.setText("Статус: Работает — Последовательный режим")
+                    self.status_label.setStyleSheet("color:green;font-weight:bold;font-size:14px;")
+                    self.status_bar.showMessage('Бот возобновлён')
 
         def _stop(self):
             self.worker.stop()
             self.btn_start.setEnabled(True); self.btn_pause.setEnabled(False); self.btn_stop.setEnabled(False)
+            self.btn_pause.setText('Пауза')
+            self._manual_paused = False
+            self._auto_paused = False
             self.status_label.setText("Статус: Остановлен"); self.status_label.setStyleSheet("color:red;font-weight:bold;font-size:14px;")
             self.status_bar.showMessage('Бот остановлен')
             self.progress_bar.setVisible(False); self.session_timer.stop()
@@ -798,6 +842,25 @@ def run_gui_app() -> None:
         def _on_progress(self):
             self.progress_bar.setVisible(True); self.progress_bar.setValue(100)
             QTimer.singleShot(350, lambda: self.progress_bar.setVisible(False))
+
+        def _on_auto_pause(self, engaged: bool):
+            self._auto_paused = engaged
+            if engaged:
+                if not self._manual_paused:
+                    self.status_label.setText("Статус: Авто-пауза — окно игры неактивно")
+                    self.status_label.setStyleSheet("color:#FF9800;font-weight:bold;font-size:14px;")
+                self.status_bar.showMessage('Ожидание активного окна игры')
+            else:
+                if self.btn_start.isEnabled():
+                    return
+                if self._manual_paused:
+                    self.status_label.setText("Статус: Пауза (Ctrl+F2)")
+                    self.status_label.setStyleSheet("color:#FF9800;font-weight:bold;font-size:14px;")
+                    self.status_bar.showMessage('Бот остаётся на паузе')
+                else:
+                    self.status_label.setText("Статус: Работает — Последовательный режим")
+                    self.status_label.setStyleSheet("color:green;font-weight:bold;font-size:14px;")
+                    self.status_bar.showMessage('Окно игры активно — работа возобновлена')
 
         def _on_detections(self, dets: list, geom: tuple, roi: tuple):
             self._last_dets = dets; self._last_geom = geom; self._last_roi = roi
@@ -996,6 +1059,7 @@ def run_gui_app() -> None:
             s.setValue('roi_grid_show', self.roi_grid_show.isChecked())
             s.setValue('roi_grid_size', self.roi_grid_size.value())
             s.setValue('use_canny', self.use_canny.isChecked()); s.setValue('simulation', self.simulation.isChecked())
+            s.setValue('auto_focus_pause', self.auto_pause_focus.isChecked())
             s.setValue('preview_draw_boxes', self.preview_draw_boxes.isChecked())
             s.setValue('min_press_interval', self.min_press_interval.value())
             s.setValue('min_age_before_press', self.min_age_before_press.value())
@@ -1018,6 +1082,7 @@ def run_gui_app() -> None:
             self.roi_grid_size.setValue(int(s.value('roi_grid_size', 16)))
             self.use_canny.setChecked(bool(s.value('use_canny', False, type=bool)))
             self.simulation.setChecked(bool(s.value('simulation', True, type=bool)))
+            self.auto_pause_focus.setChecked(bool(s.value('auto_focus_pause', True, type=bool)))
             self.preview_draw_boxes.setChecked(bool(s.value('preview_draw_boxes', True, type=bool)))
             self.min_press_interval.setValue(float(s.value('min_press_interval', 0.50)))
             self.min_age_before_press.setValue(float(s.value('min_age_before_press', 0.50)))
