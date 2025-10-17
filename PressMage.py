@@ -1,5 +1,5 @@
 """
-PressMage v4.5 — (ядро + GUI) — магия нажатий в двух слогах. 
+PressMage v4.5.1 — (ядро + GUI) — магия нажатий в двух слогах. 
 
 """
 
@@ -355,7 +355,6 @@ def run_gui_app() -> None:
             self._running = False
             self._paused = False
             self._stop_event = threading.Event()
-            self._auto_paused = False
             self._sessions = 0
             self._arrows_found = 0
             self._keys_pressed = 0
@@ -402,6 +401,11 @@ def run_gui_app() -> None:
                 self.auto_pause_sig.emit(False)
             self._stop_event.set()
 
+        def shutdown(self):
+            self._running = False
+            self._paused = False
+            self._stop_event.set()
+
         def toggle_pause(self):
             self._paused = not self._paused
             self.log_sig.emit("Пауза: ВКЛ" if self._paused else "Пауза: ВЫКЛ",
@@ -422,20 +426,6 @@ def run_gui_app() -> None:
                     l, t, r, b = geom
                     if r - l <= 0 or b - t <= 0:
                         self._stop_event.wait(0.2); continue
-
-                    if bool(self.params.get("auto_focus_pause", False)):
-                        fg = win32gui.GetForegroundWindow()
-                        if fg != hwnd:
-                            if not self._auto_paused:
-                                self._auto_paused = True
-                                self.auto_pause_sig.emit(True)
-                                self.log_sig.emit("Окно игры неактивно — авто-пауза", "warning")
-                            self._stop_event.wait(0.2)
-                            continue
-                        if self._auto_paused:
-                            self._auto_paused = False
-                            self.auto_pause_sig.emit(False)
-                            self.log_sig.emit("Окно игры снова активно — продолжаем", "success")
 
                     roi = (
                         l + int(self.params.get("roi_left", 0)),
